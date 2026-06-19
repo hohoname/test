@@ -16,15 +16,7 @@ const {
 } = require("discord.js");
 const { LavalinkManager } = require("lavalink-client");
 
-// جلب الإعدادات واللون العام من ملف الـ Config كما في index.js
-let globalConfig = {};
-try {
-  globalConfig = require(`${process.cwd()}/config`);
-} catch (e) {
-  globalConfig = { prefix: "!", emco: "#000000" };
-}
-const emco = globalConfig.emco || "#000000";
-
+// Node 18+ has global fetch
 const _fetch = global.fetch;
 
 function safeReadJson(filePath, fallback) {
@@ -53,6 +45,7 @@ function normalizeMentionPrefix(content, botId) {
   return null;
 }
 
+// --- helper: queue size across versions
 function getQueueSize(player) {
   const q = player?.queue;
   if (!q) return 0;
@@ -64,6 +57,7 @@ function getQueueSize(player) {
   return 0;
 }
 
+// --- helper: attempt to read "current track" across versions
 function getCurrentTrack(player) {
   return (
     player?.currentTrack ||
@@ -76,7 +70,7 @@ function getCurrentTrack(player) {
 }
 
 function trackTitle(track) {
-  return track?.info?.title || "Unknown Track";
+  return track?.info?.title || "Unknown";
 }
 function trackUrl(track) {
   return track?.info?.uri || track?.info?.url || null;
@@ -85,27 +79,178 @@ function trackEncoded(track) {
   return track?.encoded || track?.track || track?.encodedTrack || null;
 }
 
-// دالة تحويل الوقت إلى صيغة نصية mm:ss لتطابق تماماً ملف index.js
-function formatDuration(ms) {
-  if (!ms || isNaN(ms)) return "00:00";
-  const seconds = Math.floor((ms / 1000) % 60);
-  const minutes = Math.floor((ms / (1000 * 60)) % 60);
-  const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
-  return `${hours ? hours + ':' : ''}${minutes < 10 ? '0' + minutes : minutes}:${seconds < 10 ? '0' + seconds : seconds}`;
+function findImagePath(baseName) {
+  const dir = path.join(process.cwd(), "images");
+  if (!fs.existsSync(dir)) return null;
+
+  const files = fs.readdirSync(dir);
+  const prefix = baseName.toLowerCase() + ".";
+  const match = files.find((f) => f.toLowerCase().startsWith(prefix));
+  if (!match) return null;
+
+  return path.join(dir, match);
 }
 
-async function lavalinkPatchPlayer({ player, nodeHost, nodePort, nodePassword, nodeSecure, body }) {
+function buildThumbAttachment(baseName) {
+  const p = findImagePath(baseName);
+  if (!p) return null;
+
+  const ext = path.extname(p) || ".png";
+  const name = `${baseName}${ext}`;
+  return { attachment: new AttachmentBuilder(p, { name }), name };
+}
+
+/**
+ * Force-stop (keep bot in voice)
+ * Preferred: stopTrack / stop
+ * Guaranteed fallback: Lavalink REST PATCH track=null
+ */
+async function forceStopKeepConnected({ player, nodeHost, nodePort, nodePassword, nodeSecure }) {
+  try {
+    if (typeof player.stopTrack === "function") {
+      await player.stopTrack();
+      return { ok: true, via: "stopTrack" };
+    }
+  } catch {}
+
+  try {
+    if (typeof player.stop === "function") {
+      await player.stop();
+      return { ok: true, via: "stop" };
+    }
+  } catch {}
+
   try {
     if (!_fetch) return { ok: false, via: "no_fetch" };
-    const sessionId = player?.node?.sessionId || player?.node?.sessionID || player?.node?.session?.id || null;
+
+    const sessionId =
+      player?.node?.sessionId || player?.node?.sessionID || player?.node?.session?.id || null;
+
     if (!sessionId) return { ok: false, via: "no_session" };
 
     const scheme = nodeSecure ? "https" : "http";
-    const url = `${scheme}://${nodeHost}:${nodePort}/v4/sessions/${encodeURIComponent(sessionId)}/players/${encodeURIComponent(player.guildId)}`;
+    const url = `${scheme}://${nodeHost}:${nodePort}/v4/sessions/${encodeURIComponent(
+      sessionId
+    )}/players/${encodeURIComponent(player.guildId)}`;
 
     const res = await _fetch(url, {
       method: "PATCH",
-      headers: { Authorization: nodePassword, "Content-Type": "application/json" },
+      headers: {
+        Authorization: nodePassword,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        track: { encoded: null }
+      })
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, via: `rest_${res.status}`, details: txt.slice(0, 200) };
+    }
+
+    return { ok: true, via: "rest_track_null" };
+  } catch (e) {
+    return { ok: false, via: "rest_error", details: String(e?.message || e) };
+  }
+}
+
+// hard disconnect bot from voice + destroy player (best effort)
+async function forceDisconnectAndDestroyPlayer({ player }) {
+  try {
+    try {
+      if (typeof player.stopTrack === "function") await player.stopTrack().catch(() => {});
+      else if (typeof player.stop === "function") await player.stop().catch(() => {});
+    } catch {}
+
+    try {
+      if (typeof player.disconnect === "function") await player.disconnect().catch(() => {});
+    } catch {}
+
+    try {
+      if (typeof player.destroy === "function") await player.destroy().catch(() => {});
+    } catch {}
+
+    try {
+      const mgr = player?.manager || player?.lavalink || null;
+      if (mgr && typeof mgr.destroyPlayer === "function") {
+        await mgr.destroyPlayer(player.guildId).catch(() => {});
+      }
+    } catch {}
+  } catch {}
+}
+
+// try set voice channel status (if bot has perms + API exists)
+async function trySetVoiceStatus(client, guildId, voiceChannelId, text) {
+  try {
+    const g = client.guilds.cache.get(String(guildId));
+    if (!g) return;
+    const ch = g.channels.cache.get(String(voiceChannelId));
+    if (!ch) return;
+
+    if (typeof ch.setStatus === "function") {
+      await ch.setStatus(text).catch(() => {});
+      return;
+    }
+  } catch {}
+}
+
+// always set bot presence as fallback (works everywhere)
+async function trySetBotPresence(client, text) {
+  try {
+    if (!client?.user) return;
+    const name = String(text || "").trim();
+
+    if (!name) {
+      await client.user.setPresence({ activities: [], status: "online" }).catch(() => {});
+      return;
+    }
+
+    await client.user
+      .setPresence({
+        activities: [{ name, type: ActivityType.Playing }],
+        status: "online"
+      })
+      .catch(() => {});
+  } catch {}
+}
+
+// --- Emoji parsing: allow ID only, full custom emoji, or unicode
+function parseEmojiEnv(v) {
+  const s = String(v || "").trim();
+  if (!s) return null;
+
+  // <a:name:id> or <:name:id>
+  const m = s.match(/<a?:\w+:(\d+)>/);
+  if (m?.[1]) return { id: m[1] };
+
+  // digits only
+  if (/^\d+$/.test(s)) return { id: s };
+
+  // unicode emoji
+  return s;
+}
+
+// Lavalink REST PATCH helper
+async function lavalinkPatchPlayer({ player, nodeHost, nodePort, nodePassword, nodeSecure, body }) {
+  try {
+    if (!_fetch) return { ok: false, via: "no_fetch" };
+
+    const sessionId =
+      player?.node?.sessionId || player?.node?.sessionID || player?.node?.session?.id || null;
+    if (!sessionId) return { ok: false, via: "no_session" };
+
+    const scheme = nodeSecure ? "https" : "http";
+    const url = `${scheme}://${nodeHost}:${nodePort}/v4/sessions/${encodeURIComponent(
+      sessionId
+    )}/players/${encodeURIComponent(player.guildId)}`;
+
+    const res = await _fetch(url, {
+      method: "PATCH",
+      headers: {
+        Authorization: nodePassword,
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify(body)
     });
 
@@ -121,12 +266,14 @@ async function lavalinkPatchPlayer({ player, nodeHost, nodePort, nodePassword, n
 
 async function playSpecificTrack({ player, track, lavalink }) {
   const encoded = trackEncoded(track);
+
   try {
     if (typeof player.playTrack === "function") {
       await player.playTrack(track);
       return { ok: true, via: "playTrack" };
     }
   } catch {}
+
   try {
     if (typeof player.play === "function") {
       await player.play(track);
@@ -136,7 +283,11 @@ async function playSpecificTrack({ player, track, lavalink }) {
 
   if (!encoded) return { ok: false, via: "no_encoded" };
   return lavalinkPatchPlayer({
-    player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure,
+    player,
+    nodeHost: lavalink.host,
+    nodePort: lavalink.port,
+    nodePassword: lavalink.password,
+    nodeSecure: lavalink.secure,
     body: { track: { encoded } }
   });
 }
@@ -149,58 +300,42 @@ async function setPlayerVolume({ player, volume, lavalink }) {
       return { ok: true, via: "setVolume" };
     }
   } catch {}
+
   return lavalinkPatchPlayer({
-    player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure,
+    player,
+    nodeHost: lavalink.host,
+    nodePort: lavalink.port,
+    nodePassword: lavalink.password,
+    nodeSecure: lavalink.secure,
     body: { volume: v }
   });
 }
 
-async function forceStopKeepConnected({ player, nodeHost, nodePort, nodePassword, nodeSecure }) {
-  try {
-    if (typeof player.stopTrack === "function") { await player.stopTrack(); return { ok: true, via: "stopTrack" }; }
-  } catch {}
-  try {
-    if (typeof player.stop === "function") { await player.stop(); return { ok: true, via: "stop" }; }
-  } catch {}
-  return lavalinkPatchPlayer({
-    player, nodeHost, nodePort, nodePassword, nodeSecure, body: { track: { encoded: null } }
-  });
+function makeFooter(msg) {
+  const avatar =
+    msg.author?.displayAvatarURL?.({ extension: "png", size: 128 }) ||
+    msg.author?.avatarURL?.({ extension: "png", size: 128 }) ||
+    null;
+
+  return {
+    text: msg.author?.username || "User",
+    iconURL: avatar || undefined
+  };
 }
 
-async function forceDisconnectAndDestroyPlayer({ player }) {
-  try {
-    try { if (typeof player.stopTrack === "function") await player.stopTrack().catch(() => {}); else if (typeof player.stop === "function") await player.stop().catch(() => {}); } catch {}
-    try { if (typeof player.disconnect === "function") await player.disconnect().catch(() => {}); } catch {}
-    try { if (typeof player.destroy === "function") await player.destroy().catch(() => {}); } catch {}
-  } catch {}
+function makeSingleTrackEmbed({ title, msg, track }) {
+  const url = trackUrl(track);
+  const name = trackTitle(track);
+
+  const embed = new EmbedBuilder().setTitle(title).setFooter(makeFooter(msg));
+  if (url) embed.setDescription(`[${name}](${url})`);
+  else embed.setDescription(`${name}`);
+  return embed;
 }
 
-async function trySetVoiceStatus(client, guildId, voiceChannelId, text) {
-  try {
-    const g = client.guilds.cache.get(String(guildId));
-    if (!g) return;
-    const ch = g.channels.cache.get(String(voiceChannelId));
-    if (ch && typeof ch.setStatus === "function") {
-      await ch.setStatus(text).catch(() => {});
-    }
-  } catch {}
-}
-
-async function trySetBotPresence(client, text) {
-  try {
-    if (!client?.user) return;
-    const name = String(text || "").trim();
-    if (!name) {
-      await client.user.setPresence({ activities: [], status: "online" }).catch(() => {});
-      return;
-    }
-    await client.user.setPresence({
-      activities: [{ name, type: ActivityType.Playing }],
-      status: "online"
-    }).catch(() => {});
-  } catch {}
-}
-
+/**
+ * startMusicBot
+ */
 function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile }) {
   const client = new Client({
     intents: [
@@ -220,34 +355,172 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
 
   let fixedVoiceChannelId = null;
   let controlTextChannelId = null;
+
   let lastVoiceStatusText = null;
 
-  const repeatEnabled = new Map();
-  const lastKnownTrack = new Map();
-  const guildVolume = new Map();
-  const currentFilter = new Map();
+  const repeatEnabled = new Map(); // guildId -> bool
+  const lastKnownTrack = new Map(); // guildId -> track
+  const guildVolume = new Map(); // guildId -> number
+  const currentFilter = new Map(); // guildId -> filter value
 
-  // مصفوفة الأزرار المطابقة تماماً لتصميم وأيقونات ملفك index.js
-  const rowButtons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('mb:repeat').setEmoji("<:undoarrow:1224078115479883816>").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('mb:voldown').setEmoji("<:lowvolume:1224079426564788274>").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('mb:stop').setEmoji("<:pause:1224080944013770822>").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('mb:volup').setEmoji("<:highvolume:1224018170409564231>").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('mb:skip').setEmoji("<:skipstart_1:1224082806741930108>").setStyle(ButtonStyle.Secondary)
-  );
+  const EMOJI_REPEAT = parseEmojiEnv(process.env.EMOJI_REPEAT);
+  const EMOJI_VOLDOWN = parseEmojiEnv(process.env.EMOJI_VOLDOWN);
+  const EMOJI_STOP = parseEmojiEnv(process.env.EMOJI_STOP);
+  const EMOJI_VOLUP = parseEmojiEnv(process.env.EMOJI_VOLUP);
+  const EMOJI_SKIP = parseEmojiEnv(process.env.EMOJI_SKIP);
+
+  const BTN = {
+    REPEAT: "mb:repeat",
+    VOLDOWN: "mb:voldown",
+    STOP: "mb:stop",
+    VOLUP: "mb:volup",
+    SKIP: "mb:skip"
+  };
+
+  const SELECT = {
+    FILTERS: "mb:filters"
+  };
+
+  // ===== Filters Presets (Lavalink v4 style filters payload) =====
+  const eqBassLight = [
+    { band: 0, gain: 0.15 },
+    { band: 1, gain: 0.12 },
+    { band: 2, gain: 0.10 },
+    { band: 3, gain: 0.06 },
+    { band: 4, gain: 0.03 }
+  ];
+  const eqBassMed = [
+    { band: 0, gain: 0.25 },
+    { band: 1, gain: 0.20 },
+    { band: 2, gain: 0.16 },
+    { band: 3, gain: 0.10 },
+    { band: 4, gain: 0.05 }
+  ];
+  const eqBassStrong = [
+    { band: 0, gain: 0.35 },
+    { band: 1, gain: 0.28 },
+    { band: 2, gain: 0.22 },
+    { band: 3, gain: 0.14 },
+    { band: 4, gain: 0.08 }
+  ];
 
   const FILTER_PRESETS = [
-    { value: "bass_light", label: "Bass Boost (Light)", description: "تعزيز بسيط للباس", filters: { equalizer: [{ band: 0, gain: 0.15 }, { band: 1, gain: 0.12 }] } },
-    { value: "bass_medium", label: "Bass Boost (Medium)", description: "تعزيز متوسط للباس", filters: { equalizer: [{ band: 0, gain: 0.25 }, { band: 1, gain: 0.20 }] } },
-    { value: "bass_strong", label: "Bass Boost (Strong)", description: "تعزيز قوي للباس", filters: { equalizer: [{ band: 0, gain: 0.35 }, { band: 1, gain: 0.28 }] } },
-    { value: "nightcore", label: "Nightcore", description: "تسريع + رفع النغمة", filters: { timescale: { speed: 1.15, pitch: 1.2, rate: 1.0 } } },
-    { value: "reset", label: "Off / Reset", description: "إلغاء كل الفلاتر", filters: {} }
+    {
+      value: "bass_light",
+      label: "Bass Boost (Light)",
+      description: "تعزيز بسيط للباس",
+      filters: { equalizer: eqBassLight }
+    },
+    {
+      value: "bass_medium",
+      label: "Bass Boost (Medium)",
+      description: "تعزيز متوسط للباس",
+      filters: { equalizer: eqBassMed }
+    },
+    {
+      value: "bass_strong",
+      label: "Bass Boost (Strong)",
+      description: "تعزيز قوي للباس",
+      filters: { equalizer: eqBassStrong }
+    },
+    {
+      value: "nightcore",
+      label: "Nightcore",
+      description: "تسريع + رفع النغمة",
+      filters: { timescale: { speed: 1.15, pitch: 1.2, rate: 1.0 } }
+    },
+    {
+      value: "vaporwave",
+      label: "Vaporwave",
+      description: "تبطيء + خفض النغمة",
+      filters: { timescale: { speed: 0.85, pitch: 0.8, rate: 1.0 } }
+    },
+    {
+      value: "8d",
+      label: "8D (Rotation)",
+      description: "تأثير دوران ستيريو",
+      filters: { rotation: { rotationHz: 0.2 } }
+    },
+    {
+      value: "karaoke",
+      label: "Karaoke",
+      description: "تقليل صوت المغني (قد يختلف حسب الأغنية)",
+      filters: { karaoke: { level: 1.0, monoLevel: 1.0, filterBand: 220, filterWidth: 100 } }
+    },
+    {
+      value: "lowpass",
+      label: "Low Pass",
+      description: "تنعيم الصوت وتقليل الحدة",
+      filters: { lowPass: { smoothing: 20.0 } }
+    },
+    {
+      value: "tremolo",
+      label: "Tremolo",
+      description: "اهتزاز في مستوى الصوت",
+      filters: { tremolo: { frequency: 4.0, depth: 0.75 } }
+    },
+    {
+      value: "vibrato",
+      label: "Vibrato",
+      description: "اهتزاز في النغمة",
+      filters: { vibrato: { frequency: 6.0, depth: 0.75 } }
+    },
+    {
+      value: "distortion",
+      label: "Distortion",
+      description: "تشويه/ديستورت خفيف",
+      filters: {
+        distortion: {
+          sinOffset: 0.0,
+          sinScale: 1.0,
+          cosOffset: 0.0,
+          cosScale: 1.0,
+          tanOffset: 0.0,
+          tanScale: 1.0,
+          offset: 0.1,
+          scale: 1.2
+        }
+      }
+    },
+    {
+      value: "mono",
+      label: "Mono (Channel Mix)",
+      description: "تحويل الصوت لمونو",
+      filters: { channelMix: { leftToLeft: 0.5, leftToRight: 0.5, rightToLeft: 0.5, rightToRight: 0.5 } }
+    },
+    // ✅ لازم يكون آخر خيار
+    {
+      value: "reset",
+      label: "Off / Reset",
+      description: "إلغاء كل الفلاتر",
+      filters: {} // reset all
+    }
   ];
+
+  function buildControlsRow() {
+    const bRepeat = new ButtonBuilder().setCustomId(BTN.REPEAT).setStyle(ButtonStyle.Secondary);
+    if (EMOJI_REPEAT) bRepeat.setEmoji(EMOJI_REPEAT);
+
+    const bDown = new ButtonBuilder().setCustomId(BTN.VOLDOWN).setStyle(ButtonStyle.Secondary);
+    if (EMOJI_VOLDOWN) bDown.setEmoji(EMOJI_VOLDOWN);
+
+    const bStop = new ButtonBuilder().setCustomId(BTN.STOP).setStyle(ButtonStyle.Secondary);
+    if (EMOJI_STOP) bStop.setEmoji(EMOJI_STOP);
+
+    const bUp = new ButtonBuilder().setCustomId(BTN.VOLUP).setStyle(ButtonStyle.Secondary);
+    if (EMOJI_VOLUP) bUp.setEmoji(EMOJI_VOLUP);
+
+    const bSkip = new ButtonBuilder().setCustomId(BTN.SKIP).setStyle(ButtonStyle.Secondary);
+    if (EMOJI_SKIP) bSkip.setEmoji(EMOJI_SKIP);
+
+    return new ActionRowBuilder().addComponents(bRepeat, bDown, bStop, bUp, bSkip);
+  }
 
   function buildFiltersRow(guildId) {
     const current = String(currentFilter.get(String(guildId)) || "reset");
+
     const menu = new StringSelectMenuBuilder()
-      .setCustomId("mb:filters")
+      .setCustomId(SELECT.FILTERS)
       .setPlaceholder("اختر فلتر للصوت")
       .setMinValues(1)
       .setMaxValues(1)
@@ -259,6 +532,7 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
           default: p.value === current
         }))
       );
+
     return new ActionRowBuilder().addComponents(menu);
   }
 
@@ -283,8 +557,19 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
   loadState();
 
   client.lavalink = new LavalinkManager({
-    nodes: [{ id: lavalink.identifier, host: lavalink.host, port: lavalink.port, authorization: lavalink.password, secure: lavalink.secure }],
-    playerOptions: { onDisconnect: { autoReconnect: true, destroyPlayer: false }, onEmptyQueue: { destroyAfterMs: -1 } },
+    nodes: [
+      {
+        id: lavalink.identifier,
+        host: lavalink.host,
+        port: lavalink.port,
+        authorization: lavalink.password,
+        secure: lavalink.secure
+      }
+    ],
+    playerOptions: {
+      onDisconnect: { autoReconnect: true, destroyPlayer: false },
+      onEmptyQueue: { destroyAfterMs: -1 }
+    },
     sendToShard: (guildId, payload) => client.guilds.cache.get(guildId)?.shard?.send(payload)
   });
 
@@ -294,9 +579,28 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
     try {
       const nodes = client.lavalink?.nodeManager?.nodes;
       if (!nodes) return false;
-      const arr = typeof nodes.values === "function" ? Array.from(nodes.values()) : Array.isArray(nodes) ? nodes : [];
-      return arr.some((n) => n && n.connected === true);
-    } catch { return false; }
+
+      const arr =
+        typeof nodes.values === "function"
+          ? Array.from(nodes.values())
+          : Array.isArray(nodes)
+          ? nodes
+          : [];
+
+      if (!arr.length) return false;
+
+      return arr.some((n) => {
+        if (!n) return false;
+        if (n.destroyed === true) return false;
+        if (n.connected === true) return true;
+        if (String(n.state || "").toUpperCase() === "CONNECTED") return true;
+        if (String(n.status || "").toLowerCase() === "connected") return true;
+        if (n.socket && n.socket.readyState === 1) return true;
+        return false;
+      });
+    } catch {
+      return false;
+    }
   }
 
   async function updateStatusesForPlayer(player) {
@@ -304,213 +608,428 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
       if (!player) return;
       const track = getCurrentTrack(player);
       if (!track) return;
+
       lastKnownTrack.set(String(player.guildId), track);
-      const text = `Playing: ${trackTitle(track)}`.slice(0, 120);
+
+      const title = trackTitle(track);
+      const text = `Playing: ${title}`.slice(0, 120);
+
       await trySetBotPresence(client, text);
+
       const vcId = String(player.voiceChannelId || fixedVoiceChannelId || "");
-      if (vcId && lastVoiceStatusText !== text) {
-        lastVoiceStatusText = text;
-        await trySetVoiceStatus(client, targetGuildId, vcId, text);
-      }
+      if (!vcId) return;
+
+      if (lastVoiceStatusText === text) return;
+      lastVoiceStatusText = text;
+
+      await trySetVoiceStatus(client, targetGuildId, vcId, text);
     } catch {}
   }
 
   async function applyFilterPreset({ player, presetValue }) {
     const preset = FILTER_PRESETS.find((x) => x.value === presetValue);
     if (!preset) return { ok: false, reason: "unknown_preset" };
+
+    // REST patch is the most compatible across libs
     const r = await lavalinkPatchPlayer({
-      player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure,
+      player,
+      nodeHost: lavalink.host,
+      nodePort: lavalink.port,
+      nodePassword: lavalink.password,
+      nodeSecure: lavalink.secure,
       body: { filters: preset.filters }
     });
-    if (r.ok) currentFilter.set(String(player.guildId), preset.value);
+
+    if (r.ok) {
+      currentFilter.set(String(player.guildId), preset.value);
+    }
     return { ok: r.ok, preset };
   }
 
-  // دالة إرسال إيمبد التشغيل الفوري المتطابقة مع دالة playSong في ملف index.js
-  async function sendNowPlayingEmbedToChannel({ channel, track, guildId }) {
+  // ✅ send "Now Playing" embed WITH buttons + filters menu
+  async function sendNowPlayingEmbedToChannel({ channel, msgForFooter, track, thumbBaseName = "play", guildId }) {
     try {
       if (!channel || !track) return;
-      const title = trackTitle(track);
-      const url = trackUrl(track);
-      const duration = formatDuration(track.info?.duration || track.info?.length || 0);
 
-      const embed = new EmbedBuilder()
-        .setAuthor({ name: "🎵 Playing song" })
-        .setColor(emco)
-        .addFields(
-          { name: 'Song Name', value: `***Started:* [${title}](${url})**` },
-          { name: 'Song Duration', value: `(\`${duration}\`)` }
-        )
-        .setThumbnail("https://cdn.discordapp.com/attachments/1161286178822176858/1205557078890905610/ddddd.png?ex=65d8cd85&is=65c65885&hm=c45afc56ea3abbc91d3cac1215ec2698e45a5727f5fa5ad9e958b1a8e3c87bef&")
-        .setFooter({ text: client.user.username, iconURL: client.user.displayAvatarURL() });
-
+      const embed = makeSingleTrackEmbed({ title: "playing", msg: msgForFooter, track });
+      const rowButtons = buildControlsRow();
       const rowFilters = buildFiltersRow(guildId);
-      await channel.send({ embeds: [embed], components: [rowButtons, rowFilters] }).catch(() => {});
+
+      const thumb = buildThumbAttachment(thumbBaseName);
+      const payload = { embeds: [embed], components: [rowButtons, rowFilters] };
+
+      if (thumb) {
+        embed.setThumbnail(`attachment://${thumb.name}`);
+        payload.files = [thumb.attachment];
+      }
+
+      await channel.send(payload).catch(() => {});
     } catch {}
   }
 
+  // =========================
+  // ✅ Auto-advance / Repeat
+  // =========================
   function setupAutoAdvanceOnce() {
     if (client.__autoAdvanceSetup) return;
     client.__autoAdvanceSetup = true;
 
-    const onEnd = async (player) => {
+    const shouldReactToEndReason = (payload) => {
+      const r = String(payload?.reason || payload?.reason?.type || "").toUpperCase();
+      if (!r) return true;
+      if (r.includes("FINISH")) return true;
+      if (r === "FINISHED") return true;
+      return false;
+    };
+
+    const onEnd = async (player, payload, endedTrackMaybe) => {
       try {
         if (!player) return;
-        const gid = String(player.guildId || "");
+
+        const gid = String(player.guildId || player.guildID || "");
         if (gid && String(gid) !== String(targetGuildId)) return;
+
+        if (!shouldReactToEndReason(payload)) return;
 
         const rep = !!repeatEnabled.get(String(player.guildId));
         if (rep) {
-          const endedTrack = lastKnownTrack.get(String(player.guildId));
+          const endedTrack =
+            endedTrackMaybe ||
+            payload?.track ||
+            payload?.oldTrack ||
+            payload?.current ||
+            lastKnownTrack.get(String(player.guildId)) ||
+            null;
+
           if (endedTrack) {
             await playSpecificTrack({ player, track: endedTrack, lavalink }).catch(() => {});
             setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 400);
             return;
           }
         }
+
         await new Promise((r) => setTimeout(r, 250));
-        if (getQueueSize(player) <= 0 || player.playing || player.paused) return;
+
+        const qSize = getQueueSize(player);
+        if (qSize <= 0) return;
+
+        if (player.playing || player.paused) return;
+
         await player.play().catch(() => {});
         setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 400);
-      } catch {}
+      } catch (e) {
+        console.error("[AUTO NEXT/REPEAT ERROR]", e?.message || e);
+      }
     };
 
-    client.lavalink.on("trackEnd", (player) => onEnd(player));
-    client.lavalink.on("trackStart", (player) => setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 250));
+    const attachEmitter = (emitter) => {
+      if (!emitter || typeof emitter.on !== "function") return;
+
+      const endEvents = ["trackEnd", "trackEndEvent", "end", "playerEnd", "TrackEnd"];
+      for (const ev of endEvents) {
+        try {
+          emitter.on(ev, (...args) => {
+            const player =
+              args.find((a) => a && (a.guildId || a.guildID || a.voiceChannelId || a.queue)) || args[0];
+            const payload = args[args.length - 1];
+
+            const endedTrack =
+              args.find((a) => a && a?.info?.title && (a?.encoded || a?.track || a?.encodedTrack)) ||
+              payload?.track ||
+              payload?.oldTrack ||
+              null;
+
+            onEnd(player, payload, endedTrack);
+          });
+        } catch {}
+      }
+
+      const startEvents = ["trackStart", "start", "playerStart", "TrackStart", "trackStartEvent"];
+      for (const ev of startEvents) {
+        try {
+          emitter.on(ev, (...args) => {
+            const player =
+              args.find((a) => a && (a.guildId || a.guildID || a.voiceChannelId || a.queue)) || args[0];
+            setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 250);
+          });
+        } catch {}
+      }
+    };
+
+    attachEmitter(client.lavalink);
+    attachEmitter(client.lavalink?.nodeManager);
   }
 
   async function ensurePlayer({ guildId, voiceChannelId }) {
     if (!hasAvailableNode()) throw new Error("NO_NODE_AVAILABLE_YET");
+
     let player = client.lavalink.getPlayer(guildId);
+
     if (!player) {
-      player = await client.lavalink.createPlayer({ guildId, voiceChannelId, selfDeaf: true, selfMute: false, volume: 100 });
+      player = await client.lavalink.createPlayer({
+        guildId,
+        voiceChannelId,
+        selfDeaf: true,
+        selfMute: false,
+        volume: 100
+      });
     } else {
       player.voiceChannelId = voiceChannelId;
     }
+
     if (!player.connected) await player.connect();
+
     setupAutoAdvanceOnce();
+
+    try {
+      if (player && typeof player.on === "function" && !player.__autoAdvanceAttached) {
+        player.__autoAdvanceAttached = true;
+
+        const endEvents = ["trackEnd", "end", "TrackEnd", "trackEndEvent"];
+        for (const ev of endEvents) {
+          try {
+            player.on(ev, (...args) => {
+              const payload = args[args.length - 1];
+              const reason = String(payload?.reason || "").toUpperCase();
+              if (reason && !reason.includes("FINISH") && reason !== "FINISHED") return;
+
+              const endedTrack =
+                args.find((a) => a && a?.info?.title && (a?.encoded || a?.track || a?.encodedTrack)) ||
+                payload?.track ||
+                payload?.oldTrack ||
+                lastKnownTrack.get(String(player.guildId)) ||
+                null;
+
+              setTimeout(async () => {
+                try {
+                  const rep = !!repeatEnabled.get(String(player.guildId));
+                  if (rep && endedTrack) {
+                    await playSpecificTrack({ player, track: endedTrack, lavalink }).catch(() => {});
+                    setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 400);
+                    return;
+                  }
+
+                  const qSize = getQueueSize(player);
+                  if (qSize > 0 && !player.playing && !player.paused) {
+                    await player.play().catch(() => {});
+                    setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 400);
+                  }
+                } catch {}
+              }, 250);
+            });
+          } catch {}
+        }
+
+        const startEvents = ["trackStart", "start", "TrackStart", "trackStartEvent"];
+        for (const ev of startEvents) {
+          try {
+            player.on(ev, () => setTimeout(() => updateStatusesForPlayer(player).catch(() => {}), 250));
+          } catch {}
+        }
+      }
+    } catch {}
+
     return player;
   }
 
+  function isInTargetGuild(msg) {
+    return msg.guild && String(msg.guild.id) === String(targetGuildId);
+  }
+  function isOwner(userId) {
+    return String(userId) === String(ownerUserId);
+  }
   function isMusicChannel(msg) {
-    return controlTextChannelId && String(msg.channel.id) === String(controlTextChannelId);
+    if (!controlTextChannelId) return false;
+    return String(msg.channel.id) === String(controlTextChannelId);
   }
   function isUserInBotVoiceFromMessage(msg) {
+    if (!fixedVoiceChannelId) return false;
     const userVcId = msg.member?.voice?.channelId || null;
     return userVcId && String(userVcId) === String(fixedVoiceChannelId);
   }
+  function isUserInBotVoiceFromInteraction(interaction) {
+    if (!fixedVoiceChannelId) return false;
+    const userVcId = interaction.member?.voice?.channelId || null;
+    return userVcId && String(userVcId) === String(fixedVoiceChannelId);
+  }
 
-  const pending = { avatar: false, name: false, channelId: null };
+  const pending = { avatar: false, banner: false, name: false, channelId: null };
 
   async function doResetBinding({ guildId }) {
     try {
       fixedVoiceChannelId = null;
       controlTextChannelId = null;
       saveState();
+
       lastVoiceStatusText = null;
       repeatEnabled.set(String(guildId), false);
       guildVolume.set(String(guildId), 100);
+      lastKnownTrack.delete(String(guildId));
       currentFilter.set(String(guildId), "reset");
+
       await trySetBotPresence(client, "");
+
       const player = client.lavalink.getPlayer(guildId);
-      if (player) await forceDisconnectAndDestroyPlayer({ player });
+      if (player) {
+        try {
+          try {
+            player.queue?.clear?.();
+          } catch {}
+          await forceDisconnectAndDestroyPlayer({ player });
+        } catch {}
+      }
     } catch {}
   }
 
   async function handleOwnerMentionCommand(msg) {
     const after = normalizeMentionPrefix(msg.content.trim(), client.user.id);
     if (after == null) return false;
-    if (String(msg.author.id) !== String(ownerUserId)) return true;
+    if (!isOwner(msg.author.id)) return true;
 
     const cmd = after.toLowerCase();
-    if (cmd === "come" || cmd === "كم") {
+
+    if (cmd === "come" || cmd === "كم" || cmd === "come.") {
       const vc = msg.member?.voice?.channel;
-      if (!vc) { await msg.reply("ادخل روم صوتي أولاً."); return true; }
+      if (!vc) {
+        await msg.reply("ادخل روم صوتي أولاً.");
+        return true;
+      }
+
       fixedVoiceChannelId = vc.id;
-      controlTextChannelId = msg.channel.id;
+      controlTextChannelId = vc.id;
       saveState();
-      try { await ensurePlayer({ guildId: msg.guild.id, voiceChannelId: fixedVoiceChannelId }); } catch {}
+
+      try {
+        await ensurePlayer({ guildId: msg.guild.id, voiceChannelId: fixedVoiceChannelId });
+      } catch (e) {
+        console.error("[COME ensurePlayer error]", e?.message || e);
+      }
+
       await msg.reply(`تم الربط بنجاح.\nالروم الصوتي: ${vc.name}\nالأوامر تعمل فقط داخل شات هذا الروم الصوتي.`);
       return true;
     }
-    if (cmd === "reset" || cmd === "ريست") {
+
+    if (cmd === "reset" || cmd === "ريست" || cmd === "reset.") {
       await doResetBinding({ guildId: msg.guild.id });
-      await msg.reply("تم الريست ✅\nتم فك الربط والخروج من الروم.");
+      await msg.reply("تم الريست ✅\nتم فك الربط والخروج من الروم، وتقدر تربطه بروم جديد بأمر come.");
       return true;
     }
+
     if (cmd === "setavatar") {
-      pending.avatar = true; pending.name = false; pending.channelId = msg.channel.id;
+      pending.avatar = true;
+      pending.banner = false;
+      pending.name = false;
+      pending.channelId = msg.channel.id;
       await msg.reply("ارسل صورة الأفتار كمرفق في نفس الشات.");
       return true;
     }
+
+    if (cmd === "setbanner") {
+      pending.banner = true;
+      pending.avatar = false;
+      pending.name = false;
+      pending.channelId = msg.channel.id;
+      await msg.reply("ارسل صورة البنر كمرفق في نفس الشات.");
+      return true;
+    }
+
     if (cmd === "setname") {
-      pending.name = true; pending.avatar = false; pending.channelId = msg.channel.id;
+      pending.name = true;
+      pending.avatar = false;
+      pending.banner = false;
+      pending.channelId = msg.channel.id;
       await msg.reply("اكتب الاسم الجديد الآن في نفس الشات.");
       return true;
     }
-    return false;
+
+    await msg.reply("أمر غير معروف. الأوامر: come / reset / setavatar / setbanner / setname");
+    return true;
   }
 
   async function maybeHandlePendingOwnerSteps(msg) {
-    if (String(msg.author.id) !== String(ownerUserId)) return false;
+    if (!isOwner(msg.author.id)) return false;
     if (!pending.channelId || String(pending.channelId) !== String(msg.channel.id)) return false;
 
-    if (pending.avatar) {
+    if (pending.avatar || pending.banner) {
       const att = msg.attachments?.first();
-      if (!att?.url) { await msg.reply("لازم ترسل صورة كمرفق."); return true; }
-      try { await client.user.setAvatar(att.url); await msg.reply("تم تغيير الأفتار ✅"); } catch { await msg.reply("تعذر تغيير الصورة."); }
-      pending.avatar = false; pending.channelId = null;
+      if (!att?.url) {
+        await msg.reply("لازم ترسل صورة كمرفق.");
+        return true;
+      }
+
+      try {
+        if (pending.avatar) {
+          await client.user.setAvatar(att.url);
+          await msg.reply("تم تغيير الأفتار.");
+        } else {
+          await client.user.setBanner(att.url);
+          await msg.reply("تم تغيير البنر.");
+        }
+      } catch (e) {
+        console.error("[SET AVATAR/BANNER ERROR]", e?.message || e);
+        await msg.reply("تعذر تغيير الصورة.");
+      } finally {
+        pending.avatar = pending.banner = false;
+        pending.channelId = null;
+      }
       return true;
     }
+
     if (pending.name) {
       const newName = msg.content.trim();
       if (!newName) return true;
-      try { await client.user.setUsername(newName); await msg.reply(`تم تغيير الاسم إلى: ${newName} ✅`); } catch { await msg.reply("تعذر تغيير الاسم."); }
-      pending.name = false; pending.channelId = null;
+
+      try {
+        await client.user.setUsername(newName);
+        await msg.reply(`تم تغيير الاسم إلى: ${newName}`);
+      } catch (e) {
+        console.error("[SETNAME ERROR]", e?.message || e);
+        await msg.reply("تعذر تغيير الاسم.");
+      } finally {
+        pending.name = false;
+        pending.channelId = null;
+      }
       return true;
     }
+
     return false;
   }
 
-  // دمج مصفوفات الأوامر العربية والإنجليزية مدمجة ومتطابقة بالكامل مع index.js
+  async function replyWithThumb(msg, embed, thumbBaseName, components) {
+    const thumb = buildThumbAttachment(thumbBaseName);
+    const payload = { embeds: [embed] };
+    if (components) payload.components = components;
+
+    if (thumb) {
+      embed.setThumbnail(`attachment://${thumb.name}`);
+      payload.files = [thumb.attachment];
+      await msg.reply(payload);
+      return;
+    }
+
+    await msg.reply(payload);
+  }
+
   async function handleMusicCommands(msg) {
+    const content = msg.content.trim();
+
     if (!isMusicChannel(msg)) return;
     if (!isUserInBotVoiceFromMessage(msg)) return;
     if (!fixedVoiceChannelId) return;
 
-    let prefix = globalConfig.prefix || "!";
-    try {
-      const tokensData = safeReadJson("./tokens.json", []);
-      const tokenObj = tokensData.find(t => t.token === token);
-      if (tokenObj && tokenObj.prefix) prefix = tokenObj.prefix;
-    } catch {}
-
-    const cmdsArray = {
-      play: [`${prefix}شغل`, `${prefix}ش`, `${prefix}p`, `${prefix}play`, `${prefix}P`, `${prefix}Play`],
-      stop: [`${prefix}stop`, `${prefix}وقف`, `${prefix}Stop`, `${prefix}توقيف`],
-      skip: [`${prefix}skip`, `${prefix}سكب`, `${prefix}تخطي`, `${prefix}s`, `${prefix}س`, `${prefix}S`, `${prefix}Skip`],
-      volume: [`${prefix}volume`, `${prefix}vol`, `${prefix}صوت`, `${prefix}v`, `${prefix}ص`,`${prefix}V`,`${prefix}Vol`,`${prefix}Volume`],
-      nowplaying: [`${prefix}nowplaying`, `${prefix}np`,`${prefix}Np`,`${prefix}Nowplaying`,`${prefix}الشغال`,`${prefix}الان`],
-      loop: [`${prefix}loop`, `${prefix}تكرار`, `${prefix}l`,`${prefix}L`,`${prefix}Loop`],
-      pause: [`${prefix}pause`, `${prefix}توقيف`, `${prefix}كمل`, `${prefix}pa`,`${prefix}Pa`,`${prefix}Pause`],
-      queue: [`${prefix}queue`, `${prefix}قائمة`, `${prefix}اغاني`, `${prefix}q`, `${prefix}qu`,`${prefix}Q`,`${prefix}Qu`,`${prefix}Queue`],
-    };
-
-    const firstWord = msg.content.split(' ')[0];
-
-    // --- أمر التشغيل (Play) ---
-    if (cmdsArray.play.some((cmd) => firstWord === cmd)) {
-      const query = msg.content.split(' ').slice(1).join(' ');
-      if (!query) {
-        const embed = new EmbedBuilder()
-          .setAuthor({ name: "اوامر التشغيل:" })
-          .setDescription(`***\`play [ title ]\` :** plays first result from **YouTube***.\n***\`play [URL]\` :** searches **YouTube, Spotify**, **SoundCloud***.`)
-          .setColor(emco);
-        return msg.reply({ embeds: [embed] }).catch(() => 0);
-      }
+    // PLAY / QUEUE
+    if (content.startsWith("ش ")) {
+      const query = content.slice(2).trim();
+      if (!query) return;
 
       let player;
-      try { player = await ensurePlayer({ guildId: msg.guild.id, voiceChannelId: fixedVoiceChannelId }); } catch (e) { return; }
+      try {
+        player = await ensurePlayer({ guildId: msg.guild.id, voiceChannelId: fixedVoiceChannelId });
+      } catch (e) {
+        if (String(e?.message) === "NO_NODE_AVAILABLE_YET") return;
+        console.error("[PLAY ensurePlayer error]", e?.message || e);
+        return;
+      }
 
       const res = await player.search({ query }, msg.author);
       if (!res?.tracks?.length) return;
@@ -520,233 +1039,375 @@ function startMusicBot({ token, targetGuildId, ownerUserId, lavalink, stateFile 
 
       if (!player.playing && !player.paused) {
         await player.play();
+
         lastKnownTrack.set(String(msg.guild.id), track);
         if (!guildVolume.has(String(msg.guild.id))) guildVolume.set(String(msg.guild.id), 100);
         if (!currentFilter.has(String(msg.guild.id))) currentFilter.set(String(msg.guild.id), "reset");
+
         await updateStatusesForPlayer(player);
 
-        await sendNowPlayingEmbedToChannel({ channel: msg.channel, track, guildId: msg.guild.id });
-      } else {
-        const duration = formatDuration(track.info?.duration || track.info?.length || 0);
-        const embed = new EmbedBuilder()
-          .setAuthor({ name: "ϟ Adding to queue" })
-          .setColor(emco)
-          .addFields(
-            { name: 'Song Name', value: `**${trackTitle(track)}**` },
-            { name: 'Song Duration', value: `(\`${duration}\`)` }
-          )
-          .setThumbnail("https://cdn.discordapp.com/attachments/1091536665912299530/1169710999268491325/NowPlaying.png?ex=65566542&is=6543f042&hm=00a5c0c58c2c36e143b5b778cc3681aea08c75b8458c413133a490343197ec7b&")
-          .setFooter({ text: client.user.username, iconURL: client.user.displayAvatarURL() });
-        await msg.reply({ embeds: [embed] }).catch(() => 0);
+        const embed = makeSingleTrackEmbed({ title: "playing", msg, track });
+        const rowButtons = buildControlsRow();
+        const rowFilters = buildFiltersRow(msg.guild.id);
+
+        await replyWithThumb(msg, embed, "play", [rowButtons, rowFilters]);
+        return;
       }
+
+      const embed = makeSingleTrackEmbed({ title: "queued", msg, track });
+      await replyWithThumb(msg, embed, "queue");
+      return;
     }
 
-    // --- أمر الإيقاف (Stop) ---
-    else if (cmdsArray.stop.some((cmd) => firstWord === cmd)) {
+    // STOP (command)
+    if (content === "وقف") {
       const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player || (!player.playing && !player.paused)) {
-        const embed = new EmbedBuilder().setDescription(`**🎶 There must be music playing to use that!**`).setColor(emco);
-        return msg.channel.send({ embeds: [embed] }).catch(() => 0);
+      if (!player || (!player.playing && !player.paused)) return;
+
+      const current = getCurrentTrack(player);
+
+      try {
+        player.queue?.clear?.();
+      } catch {}
+
+      const r = await forceStopKeepConnected({
+        player,
+        nodeHost: lavalink.host,
+        nodePort: lavalink.port,
+        nodePassword: lavalink.password,
+        nodeSecure: lavalink.secure
+      });
+
+      if (!r.ok) {
+        console.error("[STOP FAILED]", r);
+        return;
       }
-      try { player.queue?.clear?.(); } catch {}
-      await forceStopKeepConnected({ player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure });
 
       lastVoiceStatusText = null;
       await trySetBotPresence(client, "");
       trySetVoiceStatus(client, targetGuildId, fixedVoiceChannelId, "").catch(() => {});
 
-      const embed = new EmbedBuilder()
-        .setDescription("**ϟ Songs Has Been :** ***Stopped***")
-        .setColor(emco)
-        .setThumbnail("https://cdn.discordapp.com/attachments/1091536665912299530/1169710999268491325/NowPlaying.png?ex=65566542&is=6543f042&hm=00a5c0c58c2c36e143b5b778cc3681aea08c75b8458c413133a490343197ec7b&");
-      await msg.reply({ embeds: [embed] }).catch(() => 0);
+      const embed = makeSingleTrackEmbed({ title: "stopped", msg, track: current });
+      await replyWithThumb(msg, embed, "stop");
+      return;
     }
 
-    // --- أمر التخطي (Skip) ---
-    else if (cmdsArray.skip.some((cmd) => firstWord === cmd)) {
+    // SKIP (command) ✅ after skip: send NEW playing embed + buttons + filters
+    if (content === "تخطي") {
       const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player || (!player.playing && !player.paused)) {
-        const embed = new EmbedBuilder().setDescription(`**🎶 There must be music playing to use that!**`).setColor(emco);
-        return msg.channel.send({ embeds: [embed] }).catch(() => 0);
-      }
+      if (!player || (!player.playing && !player.paused)) return;
 
-      const current = getCurrentTrack(player);
       const qSize = getQueueSize(player);
 
       if (qSize <= 0) {
-        await forceStopKeepConnected({ player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure });
-        lastVoiceStatusText = null; await trySetBotPresence(client, "");
+        const r = await forceStopKeepConnected({
+          player,
+          nodeHost: lavalink.host,
+          nodePort: lavalink.port,
+          nodePassword: lavalink.password,
+          nodeSecure: lavalink.secure
+        });
+
+        if (!r.ok) {
+          console.error("[SKIP(no-next) FAILED]", r);
+          return;
+        }
+
+        lastVoiceStatusText = null;
+        await trySetBotPresence(client, "");
         trySetVoiceStatus(client, targetGuildId, fixedVoiceChannelId, "").catch(() => {});
-        return msg.react(`✅`).catch(() => 0);
+        return;
       }
 
-      await player.skip();
-      const embed = new EmbedBuilder()
-        .setDescription(`***ϟ Skipped ${trackTitle(current)}***`)
-        .setColor(emco)
-        .setThumbnail("https://cdn.discordapp.com/attachments/1161286178822176858/1205556141032214618/111.png?ex=65d8cca6&is=65c657a6&hm=44e2be2c07211ae17c441738b34edecb7a090a411b30da2283c4712fe7131dea&");
-      await msg.channel.send({ embeds: [embed] }).catch(() => 0);
-    }
-
-    // --- أمر التكرار (Loop) ---
-    else if (cmdsArray.loop.some((cmd) => firstWord === cmd)) {
-      const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player) return msg.channel.send({ embeds: [new EmbedBuilder().setDescription(`**🎶 There must be music playing to use that!**`).setColor(emco)] }).catch(() => 0);
-
-      const cur = !!repeatEnabled.get(msg.guild.id);
-      const next = !cur;
-      repeatEnabled.set(msg.guild.id, next);
-
-      const embed = new EmbedBuilder()
-        .setDescription(`_Repeat mode set to :_ ${next ? "**ON ..**" : "**OFF ..**"}`)
-        .setThumbnail("https://cdn.discordapp.com/attachments/1161286178822176858/1205556753752789043/Untitled-1.png?ex=65d8cd38&is=65c65838&hm=29f9c403050d6f24f661f21a34fd1604be145afdb38e181610c9685d1c6b72ff&")
-        .setColor(emco);
-      await msg.reply({ embeds: [embed] }).catch(() => 0);
-    }
-
-    // --- أمر الصوت (Volume) ---
-    else if (cmdsArray.volume.some((cmd) => firstWord === cmd)) {
-      const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player) return msg.reply(`🎶 There must be music playing to use that!`).catch(() => 0);
-
-      const volArg = msg.content.split(' ')[1];
-      if (!volArg) {
-        const embed = new EmbedBuilder()
-          .setDescription(`_🔊 Current volume is :_ **${guildVolume.get(msg.guild.id) || 100}**`)
-          .setColor(emco)
-          .setThumbnail("https://cdn.discordapp.com/attachments/1091536665912299530/1170057890506223647/4f4b99efc0371.png?ex=6557a853&is=65453353&hm=40e45c153b144474c1ca95c2854f3f21933cc20c1d2abc1f0ec1e8945da812ea&");
-        return msg.reply({ embeds: [embed] }).catch(() => 0);
+      try {
+        await player.skip();
+      } catch (e) {
+        console.error("[SKIP ERROR]", e?.message || e);
+        return;
       }
 
-      const volume = parseInt(volArg);
-      if (isNaN(volume) || volume > 150 || volume < 0) {
-        const embed = new EmbedBuilder().setDescription(`🚫 Volume must be a valid integer between 0 and 150!`).setColor(emco);
-        return msg.channel.send({ embeds: [embed] }).catch(() => 0);
+      await new Promise((r) => setTimeout(r, 450));
+      const nowTrack = getCurrentTrack(player);
+
+      if (nowTrack) {
+        lastKnownTrack.set(String(msg.guild.id), nowTrack);
+        await updateStatusesForPlayer(player);
+
+        await sendNowPlayingEmbedToChannel({
+          channel: msg.channel,
+          msgForFooter: msg,
+          track: nowTrack,
+          thumbBaseName: "play",
+          guildId: msg.guild.id
+        });
       }
 
-      guildVolume.set(msg.guild.id, volume);
-      await setPlayerVolume({ player, volume, lavalink });
-
-      const embed = new EmbedBuilder()
-        .setDescription(`***ϟ Volume changed from \`${volume}%\` .***`)
-        .setColor(emco)
-        .setThumbnail("https://cdn.discordapp.com/attachments/1091536665912299530/1170057890506223647/4f4b99efc0371.png?ex=6557a853&is=65453353&hm=40e45c153b144474c1ca95c2854f3f21933cc20c1d2abc1f0ec1e8945da812ea&");
-      await msg.reply({ embeds: [embed] }).catch(() => 0);
-    }
-
-    // --- أمر قائمة الانتظار (Queue) ---
-    else if (cmdsArray.queue.some((cmd) => firstWord === cmd)) {
-      const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player) return msg.reply(`🎶 There must be music playing to use that!`).catch(() => 0);
-
-      const tracks = player.queue.tracks || [];
-      const songNames = tracks.slice(0, 10).map((t, i) => `\`${i + 1}\`. ${trackTitle(t)}`).join('\n') || "No more songs in queue.";
-
-      const embed = new EmbedBuilder()
-        .setAuthor({ name: `ϟ Total songs :  ( ${getQueueSize(player)} )` })
-        .setDescription(`*Now playing :* \n${songNames}`)
-        .setThumbnail("https://cdn.discordapp.com/attachments/1161286178822176858/1205557078890905610/ddddd.png?ex=65d8cd85&is=65c65885&hm=c45afc56ea3abbc91d3cac1215ec2698e45a5727f5fa5ad9e958b1a8e3c87bef&")
-        .setColor(emco)
-        .setFooter({ text: client.user.username, iconURL: client.user.displayAvatarURL() });
-      await msg.channel.send({ embeds: [embed] }).catch(() => 0);
-    }
-
-    // --- أمر الشغال حالياً (Now Playing) ---
-    else if (cmdsArray.nowplaying.some((cmd) => firstWord === cmd)) {
-      const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player) return msg.reply(`🎶 There must be music playing to use that!`).catch(() => 0);
-
-      const track = getCurrentTrack(player);
-      const embed = new EmbedBuilder()
-        .setAuthor({ name: 'Playing now', iconURL: client.user.displayAvatarURL({ dynamic: true }) })
-        .setColor(emco)
-        .setDescription(`**[${trackTitle(track)}](${trackUrl(track)})**`)
-        .setFooter({ text: msg.author.username, iconURL: msg.author.avatarURL() });
-      await msg.channel.send({ embeds: [embed] }).catch(() => 0);
-    }
-
-    // --- أمر الإيقاف المؤقت / الاستئناف (Pause / Resume) ---
-    else if (cmdsArray.pause.some((cmd) => firstWord === cmd)) {
-      const player = client.lavalink.getPlayer(msg.guild.id);
-      if (!player) return msg.reply(`🎶 There must be music playing to use that!`).catch(() => 0);
-
-      if (player.paused) {
-        await player.resume(); msg.react("▶️").catch(() => 0);
-      } else {
-        await player.pause(); msg.react("⏸️").catch(() => 0);
-      }
+      return;
     }
   }
 
-  // مستمع التفاعلات (أزرار التحكم وقائمة الفلاتر)
+  // =========================
+  // ✅ Interactions (Buttons + Select Menu)
+  // =========================
   client.on("interactionCreate", async (interaction) => {
     try {
-      if (!interaction.guild || String(interaction.guild.id) !== String(targetGuildId)) return;
-      if (controlTextChannelId && String(interaction.channelId) !== String(controlTextChannelId)) return;
-      if (fixedVoiceChannelId && String(interaction.member?.voice?.channelId) !== String(fixedVoiceChannelId)) return;
+      if (!interaction.guild) return;
+      if (String(interaction.guild.id) !== String(targetGuildId)) return;
+
+      // لازم يكون داخل شات التحكم
+      if (controlTextChannelId && String(interaction.channelId) !== String(controlTextChannelId)) {
+        await interaction.reply({ content: "التفاعل يعمل فقط في شات الروم.", ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      // لازم يكون مع البوت بالروم
+      if (!isUserInBotVoiceFromInteraction(interaction)) {
+        await interaction.reply({ content: "لازم تكون مع البوت بالروم الصوتي.", ephemeral: true }).catch(() => {});
+        return;
+      }
 
       const player = client.lavalink.getPlayer(interaction.guild.id);
-      if (!player) return;
+      if (!player) {
+        // لو القائمة/الزر تم ضغطه وما فيه تشغيل
+        if (interaction.isRepliable()) {
+          await interaction.reply({ content: "ما فيه تشغيل حالياً.", ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
 
       const gid = String(interaction.guild.id);
+      const vcId = fixedVoiceChannelId;
 
+      // ===== Buttons =====
       if (interaction.isButton()) {
-        if (interaction.customId === "mb:repeat") {
-          const next = !repeatEnabled.get(gid); repeatEnabled.set(gid, next);
-          await interaction.reply({ content: next ? "تكرار الاغنيه: ON ✅" : "تكرار الاغنيه: OFF ❌", ephemeral: true });
+        // REPEAT toggle
+        if (interaction.customId === BTN.REPEAT) {
+          const cur = !!repeatEnabled.get(gid);
+          const next = !cur;
+          repeatEnabled.set(gid, next);
+
+          await interaction
+            .reply({ content: next ? "تكرار الاغنيه: ON ✅" : "تكرار الاغنيه: OFF ❌", ephemeral: true })
+            .catch(() => {});
+          return;
         }
-        else if (interaction.customId === "mb:voldown") {
-          const next = Math.max(0, (guildVolume.get(gid) || 100) - 10); guildVolume.set(gid, next);
-          await setPlayerVolume({ player, volume: next, lavalink });
-          await interaction.reply({ content: `***ϟ Volume changed from \`${next}%\` .***`, ephemeral: true });
+
+        // VOL DOWN
+        if (interaction.customId === BTN.VOLDOWN) {
+          const current = Number(guildVolume.get(gid) ?? player.volume ?? 100) || 100;
+          const next = Math.max(15, current - 15);
+          guildVolume.set(gid, next);
+
+          await setPlayerVolume({ player, volume: next, lavalink }).catch(() => {});
+          await interaction.reply({ content: `تم خفض صوت الاغاني إلى ${next}%`, ephemeral: true }).catch(() => {});
+          return;
         }
-        else if (interaction.customId === "mb:volup") {
-          const next = Math.min(150, (guildVolume.get(gid) || 100) + 10); guildVolume.set(gid, next);
-          await setPlayerVolume({ player, volume: next, lavalink });
-          await interaction.reply({ content: `***volume has been raised to \`${next}%\` .***`, ephemeral: true });
+
+        // VOL UP
+        if (interaction.customId === BTN.VOLUP) {
+          const current = Number(guildVolume.get(gid) ?? player.volume ?? 100) || 100;
+          const next = Math.min(100, current + 15);
+          guildVolume.set(gid, next);
+
+          await setPlayerVolume({ player, volume: next, lavalink }).catch(() => {});
+          await interaction.reply({ content: `تم رفع صوت الاغاني إلى ${next}%`, ephemeral: true }).catch(() => {});
+          return;
         }
-        else if (interaction.customId === "mb:stop") {
-          try { player.queue?.clear?.(); } catch {}
-          await forceStopKeepConnected({ player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure });
-          await interaction.reply({ content: "تم إيقاف الاغنيه ✅", ephemeral: true });
-        }
-        else if (interaction.customId === "mb:skip") {
-          if (getQueueSize(player) <= 0) {
-            await forceStopKeepConnected({ player, nodeHost: lavalink.host, nodePort: lavalink.port, nodePassword: lavalink.password, nodeSecure: lavalink.secure });
-            return interaction.reply({ content: "*Server queue is empty.*", ephemeral: true });
+
+        // STOP (button): stop current track only
+        if (interaction.customId === BTN.STOP) {
+          const r = await forceStopKeepConnected({
+            player,
+            nodeHost: lavalink.host,
+            nodePort: lavalink.port,
+            nodePassword: lavalink.password,
+            nodeSecure: lavalink.secure
+          });
+
+          if (!r.ok) {
+            await interaction.reply({ content: "تعذر إيقاف الاغنيه.", ephemeral: true }).catch(() => {});
+            return;
           }
-          await player.skip();
-          await interaction.reply({ content: "***ϟ Skipped the current song.***", ephemeral: true });
+
+          lastVoiceStatusText = null;
+          await trySetBotPresence(client, "");
+          if (vcId) trySetVoiceStatus(client, targetGuildId, vcId, "").catch(() => {});
+
+          await interaction.reply({ content: "تم إيقاف الاغنيه ✅", ephemeral: true }).catch(() => {});
+          return;
+        }
+
+        // SKIP (button) ✅ after skip: send NEW playing embed + buttons + filters
+        if (interaction.customId === BTN.SKIP) {
+          if (!player.playing && !player.paused) {
+            await interaction.reply({ content: "ما فيه اغنيه شغاله.", ephemeral: true }).catch(() => {});
+            return;
+          }
+
+          const qSize = getQueueSize(player);
+
+          if (qSize <= 0) {
+            const r = await forceStopKeepConnected({
+              player,
+              nodeHost: lavalink.host,
+              nodePort: lavalink.port,
+              nodePassword: lavalink.password,
+              nodeSecure: lavalink.secure
+            });
+
+            if (!r.ok) {
+              await interaction.reply({ content: "تعذر تخطي الاغنيه.", ephemeral: true }).catch(() => {});
+              return;
+            }
+
+            lastVoiceStatusText = null;
+            await trySetBotPresence(client, "");
+            if (vcId) trySetVoiceStatus(client, targetGuildId, vcId, "").catch(() => {});
+
+            await interaction.reply({ content: "تم إيقاف الاغنيه (ما فيه طابور).", ephemeral: true }).catch(() => {});
+            return;
+          }
+
+          try {
+            await player.skip();
+          } catch {
+            await interaction.reply({ content: "تعذر تخطي الاغنيه.", ephemeral: true }).catch(() => {});
+            return;
+          }
+
+          await interaction.reply({ content: "تم التخطي ✅", ephemeral: true }).catch(() => {});
+
+          setTimeout(async () => {
+            try {
+              const nowTrack = getCurrentTrack(player);
+              if (!nowTrack) return;
+
+              lastKnownTrack.set(gid, nowTrack);
+              await updateStatusesForPlayer(player);
+
+              await sendNowPlayingEmbedToChannel({
+                channel: interaction.channel,
+                msgForFooter: { author: interaction.user },
+                track: nowTrack,
+                thumbBaseName: "play",
+                guildId: interaction.guild.id
+              });
+            } catch {}
+          }, 500);
+
+          return;
         }
       }
 
-      if (interaction.isStringSelectMenu() && interaction.customId === "mb:filters") {
+      // ===== Select Menu (Filters) =====
+      if (interaction.isStringSelectMenu() && interaction.customId === SELECT.FILTERS) {
         const chosen = interaction.values?.[0];
+        if (!chosen) {
+          await interaction.reply({ content: "اختيار غير صالح.", ephemeral: true }).catch(() => {});
+          return;
+        }
+
         const r = await applyFilterPreset({ player, presetValue: chosen });
-        if (r.ok) await interaction.reply({ content: `تم تطبيق الفلتر: ${r.preset.label}`, ephemeral: true });
+        if (!r.ok) {
+          await interaction.reply({ content: "تعذر تطبيق الفلتر.", ephemeral: true }).catch(() => {});
+          return;
+        }
+
+        // نحدّث الـ default في القائمة (بدون تعديل الرسالة القديمة عشان ما يزعج)
+        await interaction
+          .reply({
+            content: `تم تطبيق الفلتر: ${r.preset.label}\n${r.preset.description}`,
+            ephemeral: true
+          })
+          .catch(() => {});
+        return;
       }
-    } catch {}
-  });
-
-  client.on("messageCreate", async (msg) => {
-    if (msg.author.bot || !msg.guild) return;
-    if (String(msg.guild.id) !== String(targetGuildId)) return;
-
-    if (await handleOwnerMentionCommand(msg)) return;
-    if (await maybeHandlePendingOwnerSteps(msg)) return;
-
-    await handleMusicCommands(msg);
-  });
-
-  client.once("ready", async () => {
-    try { await client.lavalink.init({ id: client.user.id, username: "musicbot" }); } catch (e) {}
-    setupAutoAdvanceOnce();
-    if (fixedVoiceChannelId) {
-      await ensurePlayer({ guildId: targetGuildId, voiceChannelId: fixedVoiceChannelId }).catch(() => {});
+    } catch (e) {
+      console.error("[INTERACTIONS ERROR]", e?.message || e);
+      try {
+        if (interaction?.isRepliable && interaction.isRepliable() && !interaction.replied) {
+          await interaction.reply({ content: "صار خطأ.", ephemeral: true });
+        }
+      } catch {}
     }
   });
 
-  client.login(token).catch((e) => console.error("Login Error:", e));
+  // ✅ INIT
+  client.once("ready", async () => {
+    try {
+      await client.lavalink.init({ id: client.user.id, username: "musicbot" });
+    } catch (e) {
+      console.error("[Lavalink init error]", e?.message || e);
+    }
+
+    setupAutoAdvanceOnce();
+
+    const tryAutoConnect = async (reason = "startup") => {
+      if (!fixedVoiceChannelId) return;
+      const g = client.guilds.cache.get(String(targetGuildId));
+      if (!g) return;
+
+      const existing = client.lavalink.getPlayer(g.id);
+      if (existing?.connected) return;
+
+      await ensurePlayer({ guildId: g.id, voiceChannelId: fixedVoiceChannelId });
+      console.log(`[Auto-connect] Connected to saved VC (${fixedVoiceChannelId}) reason=${reason}`);
+    };
+
+    try {
+      client.lavalink.nodeManager.on("connect", (node) => {
+        console.log(`[Node] connected id=${node?.id}`);
+        tryAutoConnect("node_connect").catch((e) => {
+          if (String(e?.message) === "NO_NODE_AVAILABLE_YET") return;
+          console.error("[Auto-connect error]", e?.message || e);
+        });
+      });
+
+      client.lavalink.nodeManager.on("error", (node, error) => {
+        console.error(`[Node] error id=${node?.id}`, error?.message || error);
+      });
+
+      client.lavalink.nodeManager.on("disconnect", (node) => {
+        console.log(`[Node] disconnected id=${node?.id}`);
+      });
+    } catch {}
+
+    for (let i = 1; i <= 10; i++) {
+      try {
+        await tryAutoConnect(`retry_${i}`);
+        break;
+      } catch (e) {
+        if (String(e?.message) !== "NO_NODE_AVAILABLE_YET") {
+          console.error("[Auto-connect error]", e?.message || e);
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+  });
+
+  client.on("messageCreate", async (msg) => {
+    try {
+      if (!isInTargetGuild(msg)) return;
+      if (msg.author.bot) return;
+
+      if (await maybeHandlePendingOwnerSteps(msg)) return;
+
+      if (client.user && msg.mentions.has(client.user)) {
+        const handled = await handleOwnerMentionCommand(msg);
+        if (handled) return;
+      }
+
+      await handleMusicCommands(msg);
+    } catch (err) {
+      console.error("[MUSIC ERROR]", err);
+    }
+  });
+
+  process.on("unhandledRejection", (reason) => console.error("[MUSIC unhandledRejection]", reason));
+  process.on("uncaughtException", (err) => console.error("[MUSIC uncaughtException]", err));
+
+  client.login(token);
+  return client;
 }
 
 module.exports = { startMusicBot };
